@@ -1,31 +1,15 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
+import { ThemeProvider } from "@/components/theme-provider";
 import { Button } from "@/components/ui/button";
 import { Menu, X } from "lucide-react";
 import Link from "next/link";
 
 export default function SiteHeader() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [isScrolled, setIsScrolled] = useState(false);
-
-  useEffect(() => {
-    const handleScroll = () => {
-      setIsScrolled(window.scrollY > 10);
-    };
-
-    window.addEventListener("scroll", handleScroll);
-    return () => window.removeEventListener("scroll", handleScroll);
-  }, []);
-
   return (
-    <header
-      className={`border-b border-white/10 sticky top-0 z-50 transition-all duration-300 ${
-        isScrolled
-          ? "bg-cream/90 backdrop-blur-sm border-gray-200"
-          : "bg-transparent/0"
-      }`}
-    >
+    <header className="border-b border-white/10 bg-transparent backdrop-blur-sm sticky top-0 z-50">
       <div className="container mx-auto px-4 py-4 flex items-center justify-between">
         <div className="flex items-center space-x-2">
           <img
@@ -76,7 +60,7 @@ export default function SiteHeader() {
           )}
         </button>
 
-        <div className="hidden md:block">
+        <div className="flex items-center space-x-2">
           <Button
             asChild
             className="bg-[#01902e] hover:bg-[#017a26] text-white font-medium"
@@ -120,7 +104,7 @@ export default function SiteHeader() {
             </Link>
             <Button
               asChild
-              className="w-full bg-[#01902e] hover:bg-[#017a26] text-white font-medium"
+              className="w-full bg-[#01902e] hover:bg-[#fca029] text-white font-medium"
             >
               <Link href="/signup" onClick={() => setMobileMenuOpen(false)}>
                 Get Started

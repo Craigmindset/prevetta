@@ -178,10 +178,26 @@ export async function POST(request: NextRequest) {
     const moderationData = await moderationResponse.json()
     const moderationResult = moderationData.results?.[0]
 
-    if (moderationResult?.flagged) {
+
+    // Check for nudity in moderation categories for images/videos
+    const isMedia = file.type.startsWith("image/") || file.type.startsWith("video/");
+    const nudityFlagged = isMedia && moderationResult?.categories?.nudity;
+
+    if (nudityFlagged) {
+      analysisResult.issues = [
+        ...(analysisResult.issues || []),
+        {
+          type: "nudity_violation",
+          severity: "critical",
+          message: "This image or video violates the ACRON policy on image sanity and public display due to detected nudity.",
+        },
+      ];
+      analysisResult.status = "rejected";
+      analysisResult.score = Math.min(analysisResult.score || 0, 20);
+    } else if (moderationResult?.flagged) {
       const flaggedCategories = Object.entries(moderationResult.categories)
         .filter(([_, flagged]) => flagged)
-        .map(([category, _]) => category)
+        .map(([category, _]) => category);
 
       analysisResult.issues = [
         ...(analysisResult.issues || []),
@@ -190,10 +206,10 @@ export async function POST(request: NextRequest) {
           severity: "high",
           message: `Content flagged for ${category.replace(/[_-]/g, " ")}`,
         })),
-      ]
+      ];
 
-      analysisResult.status = "rejected"
-      analysisResult.score = Math.min(analysisResult.score || 0, 40)
+      analysisResult.status = "rejected";
+      analysisResult.score = Math.min(analysisResult.score || 0, 40);
     }
 
     if (!analysisResult.issues) analysisResult.issues = []
