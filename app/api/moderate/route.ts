@@ -1,252 +1,282 @@
-import { type NextRequest, NextResponse } from "next/server"
+// app/api/moderate/route.ts
+import { type NextRequest, NextResponse } from "next/server";
+import OpenAI from "openai";
+
+export const runtime = "nodejs"; // ensure Buffer is available server-side
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+type AnalysisResult = {
+  score?: number;
+  status: "approved" | "rejected" | "needs_review";
+  preVetting: string;
+  recommendations: string[];
+  copyrightIssues: Array<{ description: string; referenceLink?: string }>;
+  summary: string;
+  issues?: Array<{
+    type: string;
+    severity: "low" | "medium" | "high" | "critical";
+    message: string;
+  }>;
+  transcription?: string;
+};
 
 export async function POST(request: NextRequest) {
   try {
-    const formData = await request.formData()
-    const file = formData.get("file") as File
-    const type = formData.get("type") as string
-    const transcription = formData.get("transcription") as string
+    const formData = await request.formData();
+    const file = formData.get("file") as File | null;
+    const type = (formData.get("type") as string) || "creative";
+    const transcription = (formData.get("transcription") as string) || "";
 
     if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 })
+      return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
 
-    let analysisResult: any = {}
+    // Basic guardrails
+    const MAX_BYTES = 10 * 1024 * 1024; // 10MB
+    if (file.size > MAX_BYTES) {
+      return NextResponse.json(
+        { error: "File too large (max 10MB)" },
+        { status: 413 }
+      );
+    }
 
+    let analysisResult: AnalysisResult = {
+      status: "approved",
+      preVetting:
+        "Content has been analyzed for compliance and brand safety standards.",
+      recommendations: [],
+      copyrightIssues: [],
+      summary: "Analysis completed",
+    };
+
+    const addARCONContext = () => {
+      analysisResult.recommendations.push(
+        "Ensure compliance with ARCON advertising standards",
+        "Verify cultural appropriateness for Nigerian market",
+        "Check for required disclaimers and legal text"
+      );
+    };
+
+    // ========== IMAGE: strict nudity screening ==========
     if (file.type.startsWith("image/")) {
-      // Convert file to base64 for OpenAI Vision API
-      const bytes = await file.arrayBuffer()
-      const buffer = Buffer.from(bytes)
-      const base64Image = buffer.toString("base64")
+      // Prepare data URL for multimodal inputs
+      const bytes = await file.arrayBuffer();
+      const buffer = Buffer.from(bytes);
+      const base64 = buffer.toString("base64");
+      const dataUrl = `data:${file.type};base64,${base64}`;
 
-      // Call OpenAI Vision API for detailed image analysis
-      const visionResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o",
+      // 1) PRIMARY: OpenAI Moderation API (multimodal) — correct tags: "image_url" / "text"
+      const modResp = await openai.moderations.create({
+        model: "omni-moderation-latest",
+        input: [
+          // Optional context as text:
+          // { type: "text", text: `Strictly check for any nudity or sexual content in this ${type} image.` },
+          {
+            type: "image_url",
+            image_url: { url: dataUrl },
+          },
+        ],
+      });
+
+      const mod = modResp.results?.[0];
+      const categories = (mod?.categories ?? {}) as Record<string, boolean>;
+      const categoryScores = (mod?.category_scores ?? {}) as Record<
+        string,
+        number
+      >;
+
+      // Robust detection for any sexual/nudity-related categories (future-proof)
+      const flaggedSexualKeys = Object.entries(categories)
+        .filter(([k, v]) => v && /sexual|minors|nudity/i.test(k))
+        .map(([k]) => k);
+
+      const primaryFlag = !!mod?.flagged || flaggedSexualKeys.length > 0;
+
+      // 2) SECONDARY: Vision “judge” (belt-and-suspenders)
+      let secondaryFlag = false;
+      let visionJudge: any = null;
+
+      try {
+        const judge = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          temperature: 0,
+          response_format: { type: "json_object" },
           messages: [
             {
               role: "system",
-              content: `You are an expert advertising compliance and content moderation analyst for ARCON (Advertising Regulatory Council of Nigeria). 
-              Analyze images for:
-              1. Brand safety and appropriateness
-              2. Compliance with Nigerian advertising standards
-              3. Content moderation (inappropriate, harmful, or offensive content)
-              4. Legal compliance and regulatory requirements
-              5. Cultural sensitivity and local context
-              
-              Provide analysis in JSON format with:
-              - score (0-100)
-              - status (approved/rejected/needs_review)
-              - preVetting (grey area analysis)
-              - recommendations (array of suggestions)
-              - copyrightIssues (array with description and referenceLink if applicable)
-              - summary`,
+              content:
+                "You are a strict content safety reviewer for advertising. Return ONLY JSON with booleans (explicit_nudity, sexual_activity, partial_nudity, see_through, minors_involved) and a numeric confidence (0-1). If uncertain, mark booleans as true.",
             },
             {
               role: "user",
               content: [
                 {
                   type: "text",
-                  text: `Analyze this ${type} image for advertising compliance and content moderation. Provide:
-                  1. Pre-vetting analysis of any grey areas or concerns
-                  2. Specific suggestions for improvement
-                  3. Copyright infringement check (if similar content exists, provide reference links)
-                  4. Overall compliance assessment`,
+                  text: `Does this ${type} image contain any nudity or sexual content? Be conservative.`,
                 },
-                {
-                  type: "image_url",
-                  image_url: {
-                    url: `data:${file.type};base64,${base64Image}`,
-                  },
-                },
+                { type: "image_url", image_url: { url: dataUrl } },
               ],
             },
           ],
-          max_tokens: 1500,
-        }),
-      })
+        });
 
-      const visionData = await visionResponse.json()
-      const visionAnalysis = visionData.choices?.[0]?.message?.content
+        const raw = judge.choices?.[0]?.message?.content || "{}";
+        visionJudge = JSON.parse(raw);
 
-      try {
-        analysisResult = JSON.parse(visionAnalysis || "{}")
-      } catch (parseError) {
-        analysisResult = {
-          score: 85,
-          status: "approved",
-          preVetting: "Content has been analyzed for compliance and brand safety standards.",
-          recommendations: ["Ensure all text is clearly readable", "Verify brand guidelines compliance"],
-          copyrightIssues: [],
-          summary: "Image analysis completed successfully",
-        }
+        const {
+          explicit_nudity = false,
+          sexual_activity = false,
+          partial_nudity = false,
+          see_through = false,
+          minors_involved = false,
+        } = visionJudge;
+
+        secondaryFlag =
+          !!explicit_nudity ||
+          !!sexual_activity ||
+          !!partial_nudity ||
+          !!see_through ||
+          !!minors_involved;
+      } catch {
+        // Parsing/format failure → err on the side of caution
+        analysisResult.status = "needs_review";
+        analysisResult.issues = [
+          ...(analysisResult.issues ?? []),
+          {
+            type: "safety_fallback",
+            severity: "medium",
+            message: "Vision judge failed to parse; manual review recommended.",
+          },
+        ];
       }
-    } else if (file.type.startsWith("audio/") || file.type.startsWith("video/")) {
-      if (!transcription) {
-        return NextResponse.json({ error: "Transcription required for audio/video files" }, { status: 400 })
+
+      // STRICT decision: if either layer flags → reject
+      if (primaryFlag || secondaryFlag) {
+        analysisResult.status = "rejected";
+        analysisResult.score = 15;
+        analysisResult.summary =
+          "Nudity/sexual content flagged by automated screening.";
+        analysisResult.issues = [
+          ...(analysisResult.issues ?? []),
+          ...(flaggedSexualKeys.length
+            ? flaggedSexualKeys.map((k) => ({
+                type: "nudity_violation",
+                severity: /minors/i.test(k) ? "critical" : "high",
+                message: `Flagged category: ${k.replace(/[_-]/g, " ")}`,
+              }))
+            : []),
+          ...(secondaryFlag
+            ? [
+                {
+                  type: "nudity_violation",
+                  severity: "high",
+                  message:
+                    "Vision judge detected nudity/sexual indicators (explicit_nudity/partial_nudity/see_through/sexual_activity/minors_involved).",
+                },
+              ]
+            : []),
+        ];
+      } else if (mod?.flagged) {
+        // Future-proof catch-all
+        analysisResult.status = "rejected";
+        analysisResult.score = 25;
+        analysisResult.summary = "Content flagged by moderation model.";
+        analysisResult.issues = [
+          ...(analysisResult.issues ?? []),
+          {
+            type: "content_moderation",
+            severity: "high",
+            message: "Model flagged the image for policy risk.",
+          },
+        ];
+      } else {
+        analysisResult.status = "approved";
+        analysisResult.score = 90;
+        analysisResult.summary = "Image cleared by strict nudity screening.";
       }
 
-      // Analyze transcribed text for compliance
-      const textAnalysisResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
+      addARCONContext();
+
+      return NextResponse.json({
+        ...analysisResult,
+        moderation: {
+          flagged: !!mod?.flagged,
+          categories,
+          category_scores: categoryScores,
+          secondary_judge: visionJudge ?? {},
         },
-        body: JSON.stringify({
-          model: "gpt-4o",
-          messages: [
-            {
-              role: "system",
-              content: `You are an expert advertising compliance and content moderation analyst for ARCON (Advertising Regulatory Council of Nigeria). 
-              Analyze ${type} content transcriptions for:
-              1. Brand safety and appropriateness
-              2. Compliance with Nigerian advertising standards
-              3. Content moderation (inappropriate, harmful, or offensive language)
-              4. Legal compliance and regulatory requirements
-              5. Cultural sensitivity and local context
-              6. Audio/radio advertising specific regulations
-              
-              Provide analysis in JSON format with:
-              - score (0-100)
-              - status (approved/rejected/needs_review)
-              - preVetting (grey area analysis)
-              - recommendations (array of suggestions)
-              - copyrightIssues (array with description and referenceLink if applicable)
-              - summary`,
-            },
-            {
-              role: "user",
-              content: `Analyze this ${type} content transcription for advertising compliance and content moderation: "${transcription}"
-              
-              Provide:
-              1. Pre-vetting analysis of any grey areas or compliance concerns
-              2. Specific suggestions for script improvement
-              3. Copyright infringement check for similar audio/video content
-              4. Overall compliance assessment`,
-            },
-          ],
-          max_tokens: 1500,
-        }),
-      })
+        file_info: { name: file.name, size: file.size, type: file.type },
+      });
+    }
 
-      const textAnalysisData = await textAnalysisResponse.json()
-      const textAnalysis = textAnalysisData.choices?.[0]?.message?.content
-
-      try {
-        analysisResult = JSON.parse(textAnalysis || "{}")
-      } catch (parseError) {
-        analysisResult = {
-          score: 85,
-          status: "approved",
-          preVetting: `${type} content has been analyzed for compliance and brand safety standards.`,
-          recommendations: [
-            "Ensure clear pronunciation of brand names",
-            "Verify compliance with broadcasting standards",
-          ],
-          copyrightIssues: [],
-          summary: `${type} content analysis completed successfully`,
-        }
+    // ========== AUDIO/VIDEO: moderate transcription text ==========
+    if (file.type.startsWith("audio/") || file.type.startsWith("video/")) {
+      if (!transcription.trim()) {
+        return NextResponse.json(
+          { error: "Transcription required for audio/video files" },
+          { status: 400 }
+        );
       }
 
-      // Add transcription to result
-      analysisResult.transcription = transcription
-    }
+      const modText = await openai.moderations.create({
+        model: "omni-moderation-latest",
+        input: transcription,
+      });
+      const m = modText.results?.[0];
 
-    // Call OpenAI Moderation API for additional text content check
-    const moderationInput =
-      file.type.startsWith("audio/") || file.type.startsWith("video/")
-        ? transcription
-        : `${type} analysis for advertising compliance: ${file.name}`
+      analysisResult = {
+        status: m?.flagged ? "rejected" : "approved",
+        score: m?.flagged ? 40 : 90,
+        preVetting: `${type} content transcription analyzed for compliance and brand safety standards.`,
+        recommendations: [],
+        copyrightIssues: [],
+        summary: m?.flagged
+          ? "Transcription failed moderation."
+          : "Transcription cleared moderation.",
+        transcription,
+        issues: m?.flagged
+          ? [
+              {
+                type: "content_moderation",
+                severity: "high",
+                message: "Transcription contains policy-violating content.",
+              },
+            ]
+          : [],
+      };
 
-    const moderationResponse = await fetch("https://api.openai.com/v1/moderations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        input: moderationInput,
-      }),
-    })
+      addARCONContext();
 
-    const moderationData = await moderationResponse.json()
-    const moderationResult = moderationData.results?.[0]
-
-
-    // Check for nudity in moderation categories for images/videos
-    const isMedia = file.type.startsWith("image/") || file.type.startsWith("video/");
-    const nudityFlagged = isMedia && moderationResult?.categories?.nudity;
-
-    if (nudityFlagged) {
-      analysisResult.issues = [
-        ...(analysisResult.issues || []),
-        {
-          type: "nudity_violation",
-          severity: "critical",
-          message: "This image or video violates the ACRON policy on image sanity and public display due to detected nudity.",
+      return NextResponse.json({
+        ...analysisResult,
+        moderation: {
+          flagged: !!m?.flagged,
+          categories: m?.categories ?? {},
+          category_scores: m?.category_scores ?? {},
         },
-      ];
-      analysisResult.status = "rejected";
-      analysisResult.score = Math.min(analysisResult.score || 0, 20);
-    } else if (moderationResult?.flagged) {
-      const flaggedCategories = Object.entries(moderationResult.categories)
-        .filter(([_, flagged]) => flagged)
-        .map(([category, _]) => category);
-
-      analysisResult.issues = [
-        ...(analysisResult.issues || []),
-        ...flaggedCategories.map((category) => ({
-          type: "content_moderation",
-          severity: "high",
-          message: `Content flagged for ${category.replace(/[_-]/g, " ")}`,
-        })),
-      ];
-
-      analysisResult.status = "rejected";
-      analysisResult.score = Math.min(analysisResult.score || 0, 40);
+        file_info: { name: file.name, size: file.size, type: file.type },
+      });
     }
 
-    if (!analysisResult.issues) analysisResult.issues = []
-    if (!analysisResult.recommendations) analysisResult.recommendations = []
-    if (!analysisResult.preVetting) {
-      analysisResult.preVetting = "Content has been analyzed for compliance and brand safety standards."
-    }
-    if (!analysisResult.copyrightIssues) analysisResult.copyrightIssues = []
-
-    // Add Nigerian advertising compliance context
-    analysisResult.recommendations.push(
-      "Ensure compliance with ARCON advertising standards",
-      "Verify cultural appropriateness for Nigerian market",
-      "Check for required disclaimers and legal text",
-    )
-
+    // ========== OTHER FILE TYPES ==========
+    addARCONContext();
     return NextResponse.json({
       ...analysisResult,
-      moderation: {
-        flagged: moderationResult?.flagged || false,
-        categories: moderationResult?.categories || {},
-        category_scores: moderationResult?.category_scores || {},
-      },
-      file_info: {
-        name: file.name,
-        size: file.size,
-        type: file.type,
-      },
-    })
+      status: "needs_review",
+      score: 60,
+      summary:
+        "Unsupported file type for automated checks; manual review recommended.",
+      file_info: { name: file.name, size: file.size, type: file.type },
+    });
   } catch (error) {
-    console.error("Moderation error:", error)
+    console.error("Moderation error:", error);
     return NextResponse.json(
       {
         error: "Failed to moderate content",
         details: error instanceof Error ? error.message : "Unknown error",
       },
-      { status: 500 },
-    )
+      { status: 500 }
+    );
   }
 }
