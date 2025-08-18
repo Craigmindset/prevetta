@@ -21,7 +21,7 @@ export default function HeroSection() {
           {/* Left Content */}
           <div className="text-white ml-12 mt-20">
             <div className="text-sm font-medium text-gray-400 mb-2 tracking-wider uppercase mt-10">
-              Powered by ACRON
+              Powered by ARCON
             </div>
             <h1 className="text-4xl md:text-5xl lg:text-6xl font-bold mb-6 tracking-tight font-orbitron leading-tight">
               WHERE
